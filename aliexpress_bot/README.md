@@ -1,18 +1,14 @@
-# AliExpress Coins Bot
+# AliExpress Coins Bot v0.1.1
 
-Home Assistant App that keeps a real Chromium profile and automatically clicks the AliExpress web Daily check-in `Collect` button.
+Home Assistant App that keeps a persistent Chromium profile and collects the AliExpress daily browser coin check-in.
 
-## First setup
+## v0.1.1 workflow
 
-1. Install and start the App.
-2. Click **OPEN WEB UI**.
-3. A Chromium window running inside the App is shown through noVNC.
-4. Log in to AliExpress normally in that browser.
-5. Open the Coins page and make sure the Daily check-in card is visible.
-6. Leave the App running. The browser profile is stored in `/data/chromium-profile` and reused after restarts/updates.
+OPEN WEB UI now opens a lightweight control/status page instead of noVNC directly.
 
-The scheduled bot navigates to the Coins page by itself, finds `Collect`, clicks it and records the result.
+- **지금 로그인 · 출석 상태 확인**: checks the stored browser session and today's Collect state without intentionally collecting.
+- **지금 출석 테스트**: if Collect is available, performs the real Collect action.
+- **로그인 브라우저 열기**: opens the slower noVNC browser only when login renewal is necessary.
+- Login profile remains in `/data/chromium-profile` across App restarts and upgrades.
 
-## Important
-
-AliExpress changes its UI and anti-bot logic frequently. v0.1.0 is intentionally a first test build. If the browser page layout changes, the selector may need an update.
+Coin balance and streak are best-effort values parsed from visible AliExpress page text. If AliExpress changes its UI, they may show `확인 불가` while the core Collect automation can still work.

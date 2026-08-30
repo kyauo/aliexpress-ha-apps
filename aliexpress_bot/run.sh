@@ -5,9 +5,11 @@ export DISPLAY=:99
 PROFILE_DIR=/data/chromium-profile
 mkdir -p "$PROFILE_DIR"
 
+ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
+
 cleanup() {
-  echo "[INFO] Stopping browser services..."
-  kill "${BOT_PID:-}" "${NOVNC_PID:-}" "${VNC_PID:-}" "${CHROME_PID:-}" "${OPENBOX_PID:-}" "${XVFB_PID:-}" 2>/dev/null || true
+  echo "[$(ts)] [INFO] Stopping AliExpress Coins Bot services..."
+  kill "${BOT_PID:-}" "${NGINX_PID:-}" "${NOVNC_PID:-}" "${VNC_PID:-}" "${CHROME_PID:-}" "${OPENBOX_PID:-}" "${XVFB_PID:-}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -40,11 +42,13 @@ sleep 3
 x11vnc -display :99 -forever -shared -nopw -localhost -rfbport 5900 -quiet >/tmp/x11vnc.log 2>&1 &
 VNC_PID=$!
 
-# noVNC is exposed only through Home Assistant Ingress.
-novnc_server --listen 8099 --vnc localhost:5900 >/tmp/novnc.log 2>&1 &
+novnc_server --listen 6080 --vnc localhost:5900 >/tmp/novnc.log 2>&1 &
 NOVNC_PID=$!
 
 python3 /bot.py &
 BOT_PID=$!
+
+nginx -g 'daemon off;' >/tmp/nginx.log 2>&1 &
+NGINX_PID=$!
 
 wait "$BOT_PID"

@@ -1,6 +1,6 @@
 name: "AliExpress Coins Bot"
 description: "Collects AliExpress daily check-in coins with a persistent Chromium browser session and Home Assistant notifications."
-version: "0.1.0"
+version: "0.1.1"
 slug: "aliexpress_bot"
 init: false
 startup: application
@@ -11,7 +11,7 @@ arch:
 homeassistant_api: true
 ingress: true
 ingress_port: 8099
-ingress_entry: "/vnc.html?autoconnect=1&resize=scale&path=websockify"
+ingress_entry: "/"
 ingress_stream: true
 panel_icon: "mdi:alpha-a-circle"
 panel_title: "AliExpress Coins"

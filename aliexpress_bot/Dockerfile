@@ -8,6 +8,7 @@ RUN apk add --no-cache \
     openbox \
     novnc \
     websockify \
+    nginx \
     python3 \
     py3-pip \
     ttf-dejavu \
@@ -16,6 +17,7 @@ RUN apk add --no-cache \
 
 COPY run.sh /run.sh
 COPY bot.py /bot.py
+COPY nginx.conf /etc/nginx/http.d/default.conf
 RUN chmod +x /run.sh
 
 CMD ["/run.sh"]

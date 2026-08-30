@@ -1,13 +1,18 @@
+import html
 import json
 import os
+import re
+import threading
 import time
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 from zoneinfo import ZoneInfo
 
 import requests
 from selenium import webdriver
-from selenium.common.exceptions import JavascriptException, NoSuchElementException, WebDriverException
+from selenium.common.exceptions import JavascriptException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -17,6 +22,7 @@ STATUS_PATH = Path("/data/status.json")
 COINS_URL = "https://www.aliexpress.com/p/coin-pc-index/index.html"
 PERSISTENT_NOTIFICATION_ID = "aliexpress_coins_failure"
 OK_STATES = {"success", "already_done"}
+BROWSER_LOCK = threading.Lock()
 
 
 def load_json(path, default):
@@ -39,6 +45,16 @@ def load_options():
 def now_local(options=None):
     options = options or load_options()
     return datetime.now(ZoneInfo(options.get("timezone", "Asia/Seoul")))
+
+
+def fmt_time(value):
+    if not value:
+        return "아직 없음"
+    try:
+        dt = datetime.fromisoformat(value)
+        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return str(value)
 
 
 def log(level, message):
@@ -103,11 +119,15 @@ def browser_driver():
     return webdriver.Chrome(options=opts)
 
 
-def text_contains(driver, needles):
+def page_text(driver):
     try:
-        body = driver.find_element(By.TAG_NAME, "body").text.lower()
+        return driver.find_element(By.TAG_NAME, "body").text
     except Exception:
-        return False
+        return ""
+
+
+def text_contains(driver, needles):
+    body = page_text(driver).lower()
     return any(n.lower() in body for n in needles)
 
 
@@ -139,58 +159,165 @@ def click_element(driver, el):
         raise WebDriverException(str(exc))
 
 
+def extract_best_effort(body):
+    """Best-effort visible-text parsing only. UI wording can change."""
+    result = {"coin_balance": None, "streak_days": None}
+    compact = " ".join(body.split())
+
+    coin_patterns = [
+        r"(?:Coins?|코인)\s*[:：]?\s*([0-9][0-9,]*)",
+        r"([0-9][0-9,]*)\s*(?:Coins?|코인)",
+    ]
+    for p in coin_patterns:
+        m = re.search(p, compact, re.I)
+        if m:
+            result["coin_balance"] = m.group(1)
+            break
+
+    streak_patterns = [
+        r"(?:streak|연속[^0-9]{0,8})\s*([0-9]+)\s*(?:day|days|일)?",
+        r"([0-9]+)\s*(?:day|days|일)\s*(?:streak|연속)",
+    ]
+    for p in streak_patterns:
+        m = re.search(p, compact, re.I)
+        if m:
+            result["streak_days"] = int(m.group(1))
+            break
+    return result
+
+
+def inspect_coins_page():
+    with BROWSER_LOCK:
+        driver = None
+        try:
+            driver = browser_driver()
+            driver.get(COINS_URL)
+            WebDriverWait(driver, 25).until(
+                lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
+            )
+            time.sleep(4)
+
+            current = driver.current_url.lower()
+            body = page_text(driver)
+            if "login" in current or "signin" in current or text_contains(driver, ["sign in to aliexpress", "로그인"]):
+                state = "login_required"
+                message = "AliExpress 로그인이 필요합니다. 로그인 브라우저를 열어 로그인해 주세요."
+                info = {"logged_in": False, "today_status": "로그인 필요"}
+            else:
+                collect = find_collect(driver)
+                if collect:
+                    state = "ready"
+                    message = "로그인 상태 정상. 오늘 Collect 버튼이 보입니다."
+                    info = {"logged_in": True, "today_status": "아직 수령 전"}
+                elif text_contains(driver, ["collected", "checked in", "come back tomorrow", "already collected"]):
+                    state = "already_done"
+                    message = "로그인 상태 정상. 오늘 코인은 이미 수령한 것으로 보입니다."
+                    info = {"logged_in": True, "today_status": "수령 완료"}
+                else:
+                    state = "logged_in_unknown"
+                    message = "로그인은 유지되어 있지만 오늘 출석 상태를 화면에서 확정하지 못했습니다."
+                    info = {"logged_in": True, "today_status": "확인 불가"}
+                info.update(extract_best_effort(body))
+
+            checked = now_local()
+            save_status(
+                status_checked_at=checked.isoformat(timespec="seconds"),
+                login_state=state,
+                login_message=message,
+                **info,
+            )
+            log("INFO", f"Manual status check: {state} / {message}")
+            return state, message, info
+        except Exception as exc:
+            message = str(exc)[:400]
+            save_status(status_checked_at=now_local().isoformat(timespec="seconds"), login_state="browser_error", login_message=message)
+            log("WARNING", f"Manual status check failed: {message}")
+            return "browser_error", message, {}
+
+
 def check_and_collect():
-    driver = None
-    try:
-        driver = browser_driver()
-        driver.get(COINS_URL)
-        WebDriverWait(driver, 25).until(lambda d: d.execute_script("return document.readyState") in ("interactive", "complete"))
-        time.sleep(5)
+    with BROWSER_LOCK:
+        driver = None
+        try:
+            driver = browser_driver()
+            driver.get(COINS_URL)
+            WebDriverWait(driver, 25).until(
+                lambda d: d.execute_script("return document.readyState") in ("interactive", "complete")
+            )
+            time.sleep(5)
 
-        current = driver.current_url.lower()
-        if "login" in current or "signin" in current or text_contains(driver, ["sign in to aliexpress", "로그인"]):
-            return "login_required", "AliExpress 로그인이 필요합니다. 앱의 OPEN WEB UI에서 로그인해 주세요."
+            current = driver.current_url.lower()
+            if "login" in current or "signin" in current or text_contains(driver, ["sign in to aliexpress", "로그인"]):
+                return "login_required", "AliExpress 로그인이 필요합니다. 로그인 브라우저를 열어 로그인해 주세요."
 
-        collect = find_collect(driver)
-        if not collect:
-            if text_contains(driver, ["collected", "checked in", "come back tomorrow"]):
-                return "already_done", "오늘 코인은 이미 수령한 것으로 보입니다."
-            return "collect_not_found", "Coins 페이지에서 Collect 버튼을 찾지 못했습니다."
+            collect = find_collect(driver)
+            if not collect:
+                if text_contains(driver, ["collected", "checked in", "come back tomorrow", "already collected"]):
+                    return "already_done", "오늘 코인은 이미 수령한 것으로 보입니다."
+                return "collect_not_found", "Coins 페이지에서 Collect 버튼을 찾지 못했습니다."
 
-        before = driver.find_element(By.TAG_NAME, "body").text
-        click_element(driver, collect)
-        log("INFO", "Collect button clicked.")
-        time.sleep(6)
-        after = driver.find_element(By.TAG_NAME, "body").text
+            before = page_text(driver)
+            click_element(driver, collect)
+            log("INFO", "Collect button clicked.")
+            time.sleep(6)
+            after = page_text(driver)
 
-        # The exact AliExpress UI wording can change. Confirm using several signals.
-        if "Collect" not in after or after != before:
-            # Re-check page to distinguish a successful UI transition from a login redirect.
             current = driver.current_url.lower()
             if "login" in current or "signin" in current:
                 return "login_required", "Collect 후 로그인 화면으로 이동했습니다. 세션을 갱신해 주세요."
-            return "success", "Collect 요청 후 Coins 화면이 갱신되었습니다."
 
-        return "uncertain", "Collect를 클릭했지만 성공 여부를 화면에서 확정하지 못했습니다."
-    except WebDriverException as exc:
-        return "browser_error", str(exc)[:400]
-    except Exception as exc:
-        return "error", str(exc)[:400]
-    finally:
-        # Do not quit: driver is attached to the persistent interactive Chromium.
-        try:
-            if driver:
-                driver.close() if False else None
-        except Exception:
-            pass
+            # Prefer explicit post-click signals, with UI-change fallback.
+            if text_contains(driver, ["collected", "checked in", "come back tomorrow", "already collected"]):
+                return "success", "Collect 후 오늘 수령 완료 상태가 확인되었습니다."
+            if find_collect(driver) is None and after != before:
+                return "success", "Collect 후 버튼이 사라지고 Coins 화면이 갱신되었습니다."
+            if after != before:
+                return "success", "Collect 요청 후 Coins 화면이 갱신되었습니다."
+
+            return "uncertain", "Collect를 클릭했지만 성공 여부를 화면에서 확정하지 못했습니다."
+        except WebDriverException as exc:
+            return "browser_error", str(exc)[:400]
+        except Exception as exc:
+            return "error", str(exc)[:400]
 
 
 def failure_instruction():
     return (
-        "Home Assistant에서 AliExpress Coins 앱의 OPEN WEB UI를 열어 "
-        "AliExpress에 로그인한 뒤 Coins 화면이 보이는지 확인해 주세요. "
+        "Home Assistant에서 AliExpress Coins 앱을 열고 로그인 상태 확인을 먼저 실행해 주세요. "
+        "로그인이 풀린 경우에만 로그인 브라우저를 열어 AliExpress에 로그인하면 됩니다. "
         "브라우저 프로필은 /data/chromium-profile에 계속 보존됩니다."
     )
+
+
+def record_collect_result(state, message, manual=False):
+    checked = now_local()
+    updates = {
+        "last_run_at": checked.isoformat(timespec="seconds"),
+        "last_result": state,
+        "last_message": message,
+    }
+    if manual:
+        updates["manual_run_at"] = checked.isoformat(timespec="seconds")
+    if state in OK_STATES:
+        updates.update({
+            "last_run_date": checked.date().isoformat(),
+            "unresolved": False,
+            "failure_date": None,
+            "mobile_notified": False,
+        })
+    save_status(**updates)
+
+
+def manual_collect():
+    log("INFO", "Manual Collect test requested from Ingress UI.")
+    state, message = check_and_collect()
+    record_collect_result(state, message, manual=True)
+    if state in OK_STATES:
+        dismiss_failure()
+        log("INFO", f"Manual Collect OK: {state} / {message}")
+    else:
+        log("WARNING", f"Manual Collect failed: {state} / {message}")
+    return state, message
 
 
 def run_with_retries(options):
@@ -205,13 +332,11 @@ def run_with_retries(options):
             time.sleep(delay)
         log("INFO", "Checking AliExpress daily coin check-in.")
         last_state, last_message = check_and_collect()
-        checked = now_local(options)
-        save_status(last_run_at=checked.isoformat(timespec="seconds"), last_result=last_state, last_message=last_message)
+        record_collect_result(last_state, last_message)
 
         if last_state in OK_STATES:
             log("INFO", f"AliExpress coins OK: {last_state} / {last_message}")
             dismiss_failure()
-            save_status(last_run_date=checked.date().isoformat(), unresolved=False, failure_date=None, mobile_notified=False)
             return True
 
         log("WARNING", f"AliExpress coins failed: {last_state} / {last_message}")
@@ -226,12 +351,129 @@ def at_time(now, hhmm):
     return now.strftime("%H:%M") == hhmm
 
 
+def status_badge(status):
+    login_state = status.get("login_state")
+    if login_state in {"ready", "already_done", "logged_in_unknown"}:
+        return "good", "로그인 유지됨"
+    if login_state == "login_required":
+        return "bad", "로그인 필요"
+    return "neutral", "아직 확인 안 함"
+
+
+def render_ui(message="", message_kind=""):
+    status = load_json(STATUS_PATH, {})
+    options = load_options()
+    badge_class, badge_text = status_badge(status)
+    today_status = status.get("today_status", "아직 확인 안 함")
+    coin_balance = status.get("coin_balance") or "확인 불가"
+    streak = status.get("streak_days")
+    streak_text = f"{streak}일" if isinstance(streak, int) else "확인 불가"
+    last_result = status.get("last_result", "아직 없음")
+    last_message = status.get("last_message", "")
+    alert = ""
+    if message:
+        cls = "okmsg" if message_kind == "ok" else "warnmsg"
+        alert = f'<div class="{cls}">{html.escape(message)}</div>'
+
+    return f"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AliExpress Coins Bot</title>
+<style>
+:root {{ color-scheme: light dark; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+body {{ margin:0; background:#f4f5f7; color:#202124; }}
+.wrap {{ max-width:720px; margin:0 auto; padding:20px; position:relative; }}
+.card {{ background:white; border-radius:16px; padding:20px; box-shadow:0 2px 10px rgba(0,0,0,.08); margin-bottom:16px; }}
+h1 {{ font-size:24px; margin:0 36px 6px 0; }}
+p {{ line-height:1.55; }}
+.close {{ position:absolute; right:25px; top:22px; border:0; background:transparent; font-size:28px; cursor:pointer; color:#666; }}
+.badge {{ display:inline-block; padding:6px 10px; border-radius:999px; font-weight:700; font-size:13px; }}
+.good {{ background:#e8f5e9; color:#1b5e20; }} .bad {{ background:#ffebee; color:#b71c1c; }} .neutral {{ background:#eceff1; color:#455a64; }}
+.grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:14px; }}
+.item {{ border:1px solid #e5e7eb; border-radius:12px; padding:13px; }} .label {{ color:#6b7280; font-size:12px; }} .value {{ font-size:17px; font-weight:700; margin-top:4px; }}
+.actions {{ display:grid; gap:10px; }}
+button,.btn {{ width:100%; box-sizing:border-box; border:0; border-radius:11px; padding:13px 14px; font-size:15px; font-weight:700; cursor:pointer; text-align:center; text-decoration:none; display:block; }}
+.primary {{ background:#e64a19; color:white; }} .secondary {{ background:#e8eaed; color:#202124; }} .danger {{ background:#fff3e0; color:#bf360c; }}
+.note {{ color:#5f6368; font-size:13px; }} .okmsg,.warnmsg {{ border-radius:10px; padding:12px; margin:12px 0; }} .okmsg {{ background:#e8f5e9; }} .warnmsg {{ background:#fff3e0; }}
+small {{ color:#6b7280; }}
+@media (prefers-color-scheme:dark) {{ body{{background:#111827;color:#f3f4f6}} .card{{background:#1f2937}} .item{{border-color:#374151}} .secondary{{background:#374151;color:#f3f4f6}} .note,small,.label{{color:#9ca3af}} .close{{color:#d1d5db}} }}
+</style></head><body><div class="wrap">
+<button class="close" onclick="try{{window.parent.location.href='/'}}catch(e){{history.back()}}" aria-label="닫기">×</button>
+<div class="card"><h1>AliExpress Coins Bot</h1>
+<p>평소에는 이 화면에서 상태만 확인하면 됩니다. <b>느린 VNC 로그인 브라우저는 AliExpress 로그인이 풀렸을 때만</b> 열어 주세요.</p>
+{alert}
+<span class="badge {badge_class}">{badge_text}</span>
+<div class="grid">
+<div class="item"><div class="label">오늘 출석</div><div class="value">{html.escape(str(today_status))}</div></div>
+<div class="item"><div class="label">현재 코인</div><div class="value">{html.escape(str(coin_balance))}</div></div>
+<div class="item"><div class="label">연속 출석</div><div class="value">{html.escape(streak_text)}</div></div>
+<div class="item"><div class="label">마지막 상태 확인</div><div class="value" style="font-size:13px">{html.escape(fmt_time(status.get('status_checked_at')))}</div></div>
+</div></div>
+<div class="card"><div class="actions">
+<form method="post" action="action"><input type="hidden" name="do" value="check"><button class="primary" type="submit">지금 로그인 · 출석 상태 확인</button></form>
+<form method="post" action="action" onsubmit="return confirm('오늘 미출석이면 실제 Collect를 실행합니다. 계속할까요?');"><input type="hidden" name="do" value="collect"><button class="danger" type="submit">지금 출석 테스트</button></form>
+<a class="btn secondary" href="vnc/vnc.html?autoconnect=1&amp;resize=scale&amp;path=vnc/websockify">로그인 브라우저 열기</a>
+</div><p class="note">로그인 브라우저에서 로그인을 마치면 그냥 닫아도 됩니다. Chromium 프로필은 /data/chromium-profile에 저장되어 앱 재시작 후에도 유지됩니다.</p></div>
+<div class="card"><b>자동 실행</b><p class="note">매일 {html.escape(str(options.get('run_time','00:20')))} ({html.escape(str(options.get('timezone','Asia/Seoul')))}) · 재시도 +{options.get('retry_1_minutes',5)}분 / +{options.get('retry_2_minutes',15)}분 · 실패 확인 {html.escape(str(options.get('mobile_alert_time','09:10')))}</p>
+<div class="label">마지막 출석 실행</div><div>{html.escape(fmt_time(status.get('last_run_at')))}</div>
+<div class="label" style="margin-top:10px">마지막 결과</div><div><b>{html.escape(str(last_result))}</b> {html.escape(str(last_message))}</div></div>
+</div></body></html>"""
+
+
+class UIHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+
+    def _send_html(self, content, status=200):
+        data = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path.split("?", 1)[0] in ("/", ""):
+            self._send_html(render_ui())
+        else:
+            self._send_html(render_ui("알 수 없는 경로입니다.", "warn"), 404)
+
+    def do_POST(self):
+        if self.path.split("?", 1)[0] != "/action":
+            self._send_html(render_ui("알 수 없는 요청입니다.", "warn"), 404)
+            return
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        body = self.rfile.read(length).decode("utf-8", "replace")
+        action = parse_qs(body).get("do", [""])[0]
+        if action == "check":
+            state, message, _ = inspect_coins_page()
+            kind = "ok" if state in {"ready", "already_done", "logged_in_unknown"} else "warn"
+            self._send_html(render_ui(message, kind))
+        elif action == "collect":
+            state, message = manual_collect()
+            # Refresh read-only status after manual collect so dashboard reflects the result.
+            inspect_coins_page()
+            kind = "ok" if state in OK_STATES else "warn"
+            self._send_html(render_ui(message, kind))
+        else:
+            self._send_html(render_ui("지원하지 않는 작업입니다.", "warn"), 400)
+
+
+def start_ui_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 8098), UIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log("INFO", "Ingress control UI listening behind nginx on port 8099.")
+    return server
+
+
 def main():
     options = load_options()
     log("INFO", "Starting AliExpress Coins Bot...")
     log("INFO", "Persistent Chromium profile: /data/chromium-profile")
-    log("INFO", "Interactive login browser is available through Home Assistant Ingress.")
+    log("INFO", "Ingress opens the fast control/status UI. VNC is reserved for login renewal.")
     log("INFO", f"Daily collection: {options.get('run_time', '00:20')} ({options.get('timezone', 'Asia/Seoul')}); retries +{options.get('retry_1_minutes', 5)}m/+{options.get('retry_2_minutes', 15)}m; mobile alert check: {options.get('mobile_alert_time', '09:10')}")
+    start_ui_server()
 
     if options.get("run_on_start", False):
         run_with_retries(options)
@@ -251,14 +493,12 @@ def main():
 
             status = load_json(STATUS_PATH, {})
             if at_time(now, options.get("mobile_alert_time", "09:10")) and status.get("unresolved") and status.get("failure_date") == today and not status.get("mobile_notified"):
-                # One final attempt before bothering the user.
                 log("INFO", "Morning unresolved-failure recheck.")
                 state, message = check_and_collect()
-                save_status(last_result=state, last_message=message)
+                record_collect_result(state, message)
                 if state in OK_STATES:
                     log("INFO", f"Morning recheck recovered: {state} / {message}")
                     dismiss_failure()
-                    save_status(last_run_date=today, unresolved=False, failure_date=None, mobile_notified=False)
                 else:
                     mobile_push(options.get("mobile_notify_entity", "notify.ky17"), f"{state}: {message}\n{failure_instruction()}")
                     save_status(mobile_notified=True)
