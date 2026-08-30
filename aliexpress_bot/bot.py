@@ -104,13 +104,53 @@ def dismiss_failure():
     ha_service("persistent_notification", "dismiss", {"notification_id": PERSISTENT_NOTIFICATION_ID})
 
 
-def mobile_push(entity_id, message):
+def mobile_push(entity_id, message, title="AliExpress 코인 출석 실패"):
     if ha_service("notify", "send_message", {
         "entity_id": entity_id,
-        "title": "AliExpress 코인 출석 실패",
+        "title": title,
         "message": message,
     }):
-        log("INFO", f"Mobile notification sent to {entity_id}.")
+        log("INFO", f"Mobile notification sent to {entity_id}: {title}")
+
+
+def parse_int(value):
+    if value is None:
+        return None
+    try:
+        return int(str(value).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def success_notification(options, state):
+    if not options.get("notify_on_success", True):
+        return
+    status = load_json(STATUS_PATH, {})
+    reward = parse_int(status.get("today_reward"))
+    balance = parse_int(status.get("coin_balance"))
+    streak = status.get("streak_days")
+
+    if state == "success":
+        if reward is not None:
+            first = f"오늘 +{reward} 코인 수령 완료"
+        else:
+            first = "오늘 코인 수령 완료"
+    else:
+        if reward is not None:
+            first = f"오늘 +{reward} 코인 · 이미 수령 완료 상태 확인"
+        else:
+            first = "오늘 코인은 이미 수령 완료 상태입니다"
+
+    parts = [first]
+    if balance is not None:
+        parts.append(f"현재 {balance:,} 코인")
+    if isinstance(streak, int):
+        parts.append(f"연속 {streak}일")
+    mobile_push(
+        options.get("mobile_notify_entity", "notify.ky17"),
+        " · ".join(parts),
+        title="AliExpress 코인 출석 완료",
+    )
 
 
 def browser_driver():
@@ -162,18 +202,32 @@ def click_element(driver, el):
 
 
 def extract_best_effort(body):
-    """Best-effort visible-text parsing only. UI wording can change."""
-    result = {"coin_balance": None, "streak_days": None}
+    """Best-effort visible-text parsing only. AliExpress UI wording can change."""
+    result = {"coin_balance": None, "streak_days": None, "daily_reward": None}
     compact = " ".join(body.split())
 
+    # Prefer the account-balance card over reward-card numbers.
     coin_patterns = [
+        r"My\s+coins\s*[:：]?\s*([0-9][0-9,]*)",
+        r"내\s*코인\s*[:：]?\s*([0-9][0-9,]*)",
         r"(?:Coins?|코인)\s*[:：]?\s*([0-9][0-9,]*)",
         r"([0-9][0-9,]*)\s*(?:Coins?|코인)",
     ]
     for p in coin_patterns:
         m = re.search(p, compact, re.I)
         if m:
-            result["coin_balance"] = m.group(1)
+            result["coin_balance"] = parse_int(m.group(1))
+            break
+
+    reward_patterns = [
+        r"Today[^0-9+]{0,30}\+\s*([0-9][0-9,]*)",
+        r"오늘[^0-9+]{0,30}\+\s*([0-9][0-9,]*)",
+        r"Daily\s+check-in[^+]{0,120}\+\s*([0-9][0-9,]*)",
+    ]
+    for p in reward_patterns:
+        m = re.search(p, compact, re.I)
+        if m:
+            result["daily_reward"] = parse_int(m.group(1))
             break
 
     streak_patterns = [
@@ -219,7 +273,12 @@ def inspect_coins_page():
                     state = "logged_in_unknown"
                     message = "로그인은 유지되어 있지만 오늘 출석 상태를 화면에서 확정하지 못했습니다."
                     info = {"logged_in": True, "today_status": "확인 불가"}
-                info.update(extract_best_effort(body))
+                parsed = extract_best_effort(body)
+                info.update({
+                    "coin_balance": parsed.get("coin_balance"),
+                    "streak_days": parsed.get("streak_days"),
+                    "today_reward": parsed.get("daily_reward"),
+                })
 
             checked = now_local()
             save_status(
@@ -249,31 +308,58 @@ def check_and_collect():
             time.sleep(5)
 
             current = driver.current_url.lower()
+            before_body = page_text(driver)
+            before_info = extract_best_effort(before_body)
             if "login" in current or "signin" in current or text_contains(driver, ["sign in to aliexpress", "로그인"]):
                 return "login_required", "AliExpress 로그인이 필요합니다. 로그인 브라우저를 열어 로그인해 주세요."
 
             collect = find_collect(driver)
             if not collect:
+                save_status(
+                    coin_balance=before_info.get("coin_balance"),
+                    streak_days=before_info.get("streak_days"),
+                    today_reward=before_info.get("daily_reward"),
+                    today_status="수령 완료" if text_contains(driver, ["collected", "checked in", "come back tomorrow", "already collected"]) else "확인 불가",
+                )
                 if text_contains(driver, ["collected", "checked in", "come back tomorrow", "already collected"]):
                     return "already_done", "오늘 코인은 이미 수령한 것으로 보입니다."
                 return "collect_not_found", "Coins 페이지에서 Collect 버튼을 찾지 못했습니다."
 
-            before = page_text(driver)
             click_element(driver, collect)
             log("INFO", "Collect button clicked.")
             time.sleep(6)
-            after = page_text(driver)
+            after_body = page_text(driver)
+            after_info = extract_best_effort(after_body)
 
             current = driver.current_url.lower()
             if "login" in current or "signin" in current:
                 return "login_required", "Collect 후 로그인 화면으로 이동했습니다. 세션을 갱신해 주세요."
 
+            before_balance = parse_int(before_info.get("coin_balance"))
+            after_balance = parse_int(after_info.get("coin_balance"))
+            reward = None
+            if before_balance is not None and after_balance is not None and after_balance >= before_balance:
+                delta = after_balance - before_balance
+                if 0 < delta <= 10000:
+                    reward = delta
+            if reward is None:
+                reward = after_info.get("daily_reward") or before_info.get("daily_reward")
+
+            merged_balance = after_balance if after_balance is not None else before_balance
+            merged_streak = after_info.get("streak_days") if after_info.get("streak_days") is not None else before_info.get("streak_days")
+            save_status(
+                coin_balance=merged_balance,
+                streak_days=merged_streak,
+                today_reward=reward,
+                today_status="수령 완료",
+            )
+
             # Prefer explicit post-click signals, with UI-change fallback.
             if text_contains(driver, ["collected", "checked in", "come back tomorrow", "already collected"]):
                 return "success", "Collect 후 오늘 수령 완료 상태가 확인되었습니다."
-            if find_collect(driver) is None and after != before:
+            if find_collect(driver) is None and after_body != before_body:
                 return "success", "Collect 후 버튼이 사라지고 Coins 화면이 갱신되었습니다."
-            if after != before:
+            if after_body != before_body:
                 return "success", "Collect 요청 후 Coins 화면이 갱신되었습니다."
 
             return "uncertain", "Collect를 클릭했지만 성공 여부를 화면에서 확정하지 못했습니다."
@@ -339,6 +425,7 @@ def run_with_retries(options):
         if last_state in OK_STATES:
             log("INFO", f"AliExpress coins OK: {last_state} / {last_message}")
             dismiss_failure()
+            success_notification(options, last_state)
             return True
 
         log("WARNING", f"AliExpress coins failed: {last_state} / {last_message}")
@@ -347,6 +434,31 @@ def run_with_retries(options):
     if options.get("notify_on_failure", True):
         persistent_failure(f"{last_state}: {last_message}\n\n{failure_instruction()}")
     return False
+
+
+
+def send_manual_reminder_if_needed(options, now):
+    """At the daily deadline, remind the user if today's check-in has not been confirmed."""
+    if not options.get("notify_manual_reminder", True):
+        return
+    today = now.date().isoformat()
+    status = load_json(STATUS_PATH, {})
+    if status.get("manual_reminder_date") == today:
+        return
+    if status.get("last_run_date") == today and status.get("last_result") in OK_STATES:
+        save_status(manual_reminder_date=today)
+        log("INFO", "21:00 manual reminder skipped: today's AliExpress check-in is already confirmed.")
+        return
+
+    last_result = status.get("last_result") or "기록 없음"
+    last_message = status.get("last_message") or "오늘 성공 기록이 없습니다."
+    mobile_push(
+        options.get("mobile_notify_entity", "notify.ky17"),
+        f"21:00까지 오늘 AliExpress 코인 출석 성공이 확인되지 않았습니다. 앱에서 직접 출석을 확인해 주세요.\n마지막 상태: {last_result} / {last_message}",
+        title="AliExpress 출석 확인 필요",
+    )
+    save_status(manual_reminder_date=today)
+    log("WARNING", "21:00 manual check-in reminder sent: no confirmed success for today.")
 
 
 def at_time(now, hhmm):
@@ -370,6 +482,8 @@ def render_ui(message="", message_kind=""):
     coin_balance = status.get("coin_balance") or "확인 불가"
     streak = status.get("streak_days")
     streak_text = f"{streak}일" if isinstance(streak, int) else "확인 불가"
+    reward = parse_int(status.get("today_reward"))
+    reward_text = f"+{reward} 코인" if reward is not None else "확인 불가"
     last_result = status.get("last_result", "아직 없음")
     last_message = status.get("last_message", "")
     alert = ""
@@ -394,6 +508,10 @@ p {{ line-height:1.55; }}
 .item {{ border:1px solid #e5e7eb; border-radius:12px; padding:13px; }} .label {{ color:#6b7280; font-size:12px; }} .value {{ font-size:17px; font-weight:700; margin-top:4px; }}
 .actions {{ display:grid; gap:10px; }}
 button,.btn {{ width:100%; box-sizing:border-box; border:0; border-radius:11px; padding:13px 14px; font-size:15px; font-weight:700; cursor:pointer; text-align:center; text-decoration:none; display:block; }}
+button:disabled {{ opacity:.65; cursor:wait; }}
+.busy {{ display:none; margin:12px 0 0; border-radius:10px; padding:12px; background:#e3f2fd; color:#0d47a1; font-weight:700; }}
+.spinner {{ display:inline-block; width:14px; height:14px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; vertical-align:-2px; margin-right:7px; animation:spin .8s linear infinite; }}
+@keyframes spin {{ to {{ transform:rotate(360deg); }} }}
 .primary {{ background:#e64a19; color:white; }} .secondary {{ background:#e8eaed; color:#202124; }} .danger {{ background:#fff3e0; color:#bf360c; }}
 .note {{ color:#5f6368; font-size:13px; }} .okmsg,.warnmsg {{ border-radius:10px; padding:12px; margin:12px 0; }} .okmsg {{ background:#e8f5e9; }} .warnmsg {{ background:#fff3e0; }}
 small {{ color:#6b7280; }}
@@ -406,19 +524,51 @@ small {{ color:#6b7280; }}
 <span class="badge {badge_class}">{badge_text}</span>
 <div class="grid">
 <div class="item"><div class="label">오늘 출석</div><div class="value">{html.escape(str(today_status))}</div></div>
+<div class="item"><div class="label">오늘 획득</div><div class="value">{html.escape(reward_text)}</div></div>
 <div class="item"><div class="label">현재 코인</div><div class="value">{html.escape(str(coin_balance))}</div></div>
 <div class="item"><div class="label">연속 출석</div><div class="value">{html.escape(streak_text)}</div></div>
 <div class="item"><div class="label">마지막 상태 확인</div><div class="value" style="font-size:13px">{html.escape(fmt_time(status.get('status_checked_at')))}</div></div>
 </div></div>
 <div class="card"><div class="actions">
-<form method="post" action="action"><input type="hidden" name="do" value="check"><button class="primary" type="submit">지금 로그인 · 출석 상태 확인</button></form>
-<form method="post" action="action" onsubmit="return confirm('오늘 미출석이면 실제 Collect를 실행합니다. 계속할까요?');"><input type="hidden" name="do" value="collect"><button class="danger" type="submit">지금 출석 테스트</button></form>
-<a class="btn secondary" href="vnc/vnc.html?autoconnect=1&amp;resize=scale&amp;path=vnc/websockify">로그인 브라우저 열기</a>
-</div><p class="note">로그인 브라우저에서 로그인을 마치면 그냥 닫아도 됩니다. Chromium 프로필은 /data/chromium-profile에 저장되어 앱 재시작 후에도 유지됩니다.</p></div>
-<div class="card"><b>자동 실행</b><p class="note">매일 {html.escape(str(options.get('run_time','00:20')))} ({html.escape(str(options.get('timezone','Asia/Seoul')))}) · 재시도 +{options.get('retry_1_minutes',5)}분 / +{options.get('retry_2_minutes',15)}분 · 실패 확인 {html.escape(str(options.get('mobile_alert_time','09:10')))}</p>
+<button id="checkBtn" class="primary" type="button" onclick="runAction('check', this)">지금 로그인 · 출석 상태 확인</button>
+<button id="collectBtn" class="danger" type="button" onclick="if(confirm('오늘 미출석이면 실제 Collect를 실행합니다. 계속할까요?')) runAction('collect', this)">지금 출석 테스트</button>
+<a id="vncBtn" class="btn secondary" href="vnc/vnc.html?autoconnect=1&amp;resize=scale&amp;path=vnc/websockify">로그인 브라우저 열기</a>
+</div>
+<div id="busy" class="busy"><span class="spinner"></span><span id="busyText">처리 중...</span></div>
+<p class="note">상태 확인과 출석 테스트는 AliExpress 페이지를 실제로 확인하므로 10–20초 정도 걸릴 수 있습니다. 버튼을 누르면 즉시 진행 상태가 표시되고 완료될 때까지 중복 클릭은 막힙니다.</p>
+<p class="note">로그인 브라우저에서 로그인을 마치면 그냥 닫아도 됩니다. Chromium 프로필은 /data/chromium-profile에 저장되어 앱 재시작 후에도 유지됩니다.</p></div>
+<div class="card"><b>자동 실행</b><p class="note">매일 {html.escape(str(options.get('run_time','00:20')))} ({html.escape(str(options.get('timezone','Asia/Seoul')))}) · 재시도 +{options.get('retry_1_minutes',5)}분 / +{options.get('retry_2_minutes',15)}분 · 실패 확인 {html.escape(str(options.get('mobile_alert_time','09:10')))} · 수동 확인 알림 {html.escape(str(options.get('manual_reminder_time','21:00')))}</p>
 <div class="label">마지막 출석 실행</div><div>{html.escape(fmt_time(status.get('last_run_at')))}</div>
 <div class="label" style="margin-top:10px">마지막 결과</div><div><b>{html.escape(str(last_result))}</b> {html.escape(str(last_message))}</div></div>
-</div></body></html>"""
+</div>
+<script>
+async function runAction(action, btn) {{
+  const checkBtn = document.getElementById('checkBtn');
+  const collectBtn = document.getElementById('collectBtn');
+  const vncBtn = document.getElementById('vncBtn');
+  const busy = document.getElementById('busy');
+  const busyText = document.getElementById('busyText');
+  checkBtn.disabled = true; collectBtn.disabled = true;
+  vncBtn.style.pointerEvents = 'none'; vncBtn.style.opacity = '.6';
+  busy.style.display = 'block';
+  busyText.textContent = action === 'collect' ? '출석 처리 중... 잠시 기다려 주세요.' : '로그인 · 출석 상태 확인 중... 잠시 기다려 주세요.';
+  btn.dataset.oldText = btn.textContent;
+  btn.textContent = action === 'collect' ? '출석 처리 중...' : '상태 확인 중...';
+  try {{
+    const body = new URLSearchParams(); body.set('do', action); body.set('ajax', '1');
+    const res = await fetch('action', {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'fetch'}}, body}});
+    const data = await res.json();
+    busyText.textContent = data.message || '완료되었습니다. 화면을 갱신합니다.';
+    setTimeout(() => window.location.reload(), 350);
+  }} catch (e) {{
+    busyText.textContent = '요청 처리 중 오류가 발생했습니다: ' + e;
+    checkBtn.disabled = false; collectBtn.disabled = false;
+    vncBtn.style.pointerEvents = ''; vncBtn.style.opacity = '';
+    btn.textContent = btn.dataset.oldText || btn.textContent;
+  }}
+}}
+</script>
+</body></html>"""
 
 
 class UIHandler(BaseHTTPRequestHandler):
@@ -429,6 +579,15 @@ class UIHandler(BaseHTTPRequestHandler):
         data = content.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_json(self, payload, status=200):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -446,19 +605,30 @@ class UIHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", "0") or 0)
         body = self.rfile.read(length).decode("utf-8", "replace")
-        action = parse_qs(body).get("do", [""])[0]
+        params = parse_qs(body)
+        action = params.get("do", [""])[0]
+        ajax = params.get("ajax", [""])[0] == "1" or self.headers.get("X-Requested-With") == "fetch"
         if action == "check":
             state, message, _ = inspect_coins_page()
             kind = "ok" if state in {"ready", "already_done", "logged_in_unknown"} else "warn"
-            self._send_html(render_ui(message, kind))
+            if ajax:
+                self._send_json({"state": state, "message": message, "ok": kind == "ok"})
+            else:
+                self._send_html(render_ui(message, kind))
         elif action == "collect":
             state, message = manual_collect()
             # Refresh read-only status after manual collect so dashboard reflects the result.
             inspect_coins_page()
             kind = "ok" if state in OK_STATES else "warn"
-            self._send_html(render_ui(message, kind))
+            if ajax:
+                self._send_json({"state": state, "message": message, "ok": kind == "ok"})
+            else:
+                self._send_html(render_ui(message, kind))
         else:
-            self._send_html(render_ui("지원하지 않는 작업입니다.", "warn"), 400)
+            if ajax:
+                self._send_json({"state": "bad_request", "message": "지원하지 않는 작업입니다.", "ok": False}, 400)
+            else:
+                self._send_html(render_ui("지원하지 않는 작업입니다.", "warn"), 400)
 
 
 def start_ui_server():
@@ -474,7 +644,7 @@ def main():
     log("INFO", "Starting AliExpress Coins Bot...")
     log("INFO", "Persistent Chromium profile: /data/chromium-profile")
     log("INFO", "Ingress opens the fast control/status UI. VNC is reserved for login renewal.")
-    log("INFO", f"Daily collection: {options.get('run_time', '00:20')} ({options.get('timezone', 'Asia/Seoul')}); retries +{options.get('retry_1_minutes', 5)}m/+{options.get('retry_2_minutes', 15)}m; mobile alert check: {options.get('mobile_alert_time', '09:10')}")
+    log("INFO", f"Daily collection: {options.get('run_time', '00:20')} ({options.get('timezone', 'Asia/Seoul')}); retries +{options.get('retry_1_minutes', 5)}m/+{options.get('retry_2_minutes', 15)}m; mobile alert check: {options.get('mobile_alert_time', '09:10')}; manual reminder: {options.get('manual_reminder_time', '21:00')}")
     start_ui_server()
 
     if options.get("run_on_start", False):
@@ -501,9 +671,14 @@ def main():
                 if state in OK_STATES:
                     log("INFO", f"Morning recheck recovered: {state} / {message}")
                     dismiss_failure()
+                    success_notification(options, state)
                 else:
                     mobile_push(options.get("mobile_notify_entity", "notify.ky17"), f"{state}: {message}\n{failure_instruction()}")
                     save_status(mobile_notified=True)
+
+            status = load_json(STATUS_PATH, {})
+            if at_time(now, options.get("manual_reminder_time", "21:00")) and status.get("manual_reminder_date") != today:
+                send_manual_reminder_if_needed(options, now)
         time.sleep(5)
 
 

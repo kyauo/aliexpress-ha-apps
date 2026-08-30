@@ -1,6 +1,6 @@
 name: "AliExpress Coins Bot"
 description: "Collects AliExpress daily check-in coins with a persistent Chromium browser session and Home Assistant notifications."
-version: "0.1.2"
+version: "0.1.4"
 slug: "aliexpress_bot"
 init: false
 startup: application
@@ -23,9 +23,12 @@ options:
   retry_1_minutes: 5
   retry_2_minutes: 15
   mobile_alert_time: "09:10"
+  manual_reminder_time: "21:00"
   mobile_notify_entity: "notify.ky17"
   run_on_start: false
   notify_on_failure: true
+  notify_on_success: true
+  notify_manual_reminder: true
 
 schema:
   run_time: "match(^([01][0-9]|2[0-3]):[0-5][0-9]$)"
@@ -33,6 +36,9 @@ schema:
   retry_1_minutes: "int(1,180)"
   retry_2_minutes: "int(1,360)"
   mobile_alert_time: "match(^([01][0-9]|2[0-3]):[0-5][0-9]$)"
+  manual_reminder_time: "match(^([01][0-9]|2[0-3]):[0-5][0-9]$)"
   mobile_notify_entity: str
   run_on_start: bool
   notify_on_failure: bool
+  notify_on_success: bool
+  notify_manual_reminder: bool
