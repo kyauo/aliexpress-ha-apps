@@ -207,11 +207,12 @@ def extract_best_effort(body):
     compact = " ".join(body.split())
 
     # Prefer the account-balance card over reward-card numbers.
+    # Balance is intentionally conservative. Broad "coin" patterns can confuse
+    # streak/reward numbers (for example 7 days) with the account balance.
+    # If the explicit My coins card cannot be identified, report unknown.
     coin_patterns = [
         r"My\s+coins\s*[:：]?\s*([0-9][0-9,]*)",
         r"내\s*코인\s*[:：]?\s*([0-9][0-9,]*)",
-        r"(?:Coins?|코인)\s*[:：]?\s*([0-9][0-9,]*)",
-        r"([0-9][0-9,]*)\s*(?:Coins?|코인)",
     ]
     for p in coin_patterns:
         m = re.search(p, compact, re.I)
@@ -554,17 +555,41 @@ async function runAction(action, btn) {{
   busyText.textContent = action === 'collect' ? '출석 처리 중... 잠시 기다려 주세요.' : '로그인 · 출석 상태 확인 중... 잠시 기다려 주세요.';
   btn.dataset.oldText = btn.textContent;
   btn.textContent = action === 'collect' ? '출석 처리 중...' : '상태 확인 중...';
+
+  // Never leave the UI spinning forever. Even if an Ingress/fetch response is
+  // lost after Selenium updated status.json, reload the dashboard after 60 s.
+  let finished = false;
+  const watchdog = setTimeout(() => {{
+    if (!finished) {{
+      busyText.textContent = '응답 확인 시간이 길어져 상태 화면을 다시 불러옵니다.';
+      setTimeout(() => window.location.reload(), 800);
+    }}
+  }}, 60000);
+
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), 55000);
   try {{
     const body = new URLSearchParams(); body.set('do', action); body.set('ajax', '1');
-    const res = await fetch('action', {{method:'POST', headers:{{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'fetch'}}, body}});
+    const res = await fetch('action', {{
+      method:'POST',
+      headers:{{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'fetch'}},
+      body,
+      signal: controller.signal,
+      cache: 'no-store'
+    }});
     const data = await res.json();
+    finished = true; clearTimeout(watchdog); clearTimeout(abortTimer);
     busyText.textContent = data.message || '완료되었습니다. 화면을 갱신합니다.';
     setTimeout(() => window.location.reload(), 350);
   }} catch (e) {{
-    busyText.textContent = '요청 처리 중 오류가 발생했습니다: ' + e;
-    checkBtn.disabled = false; collectBtn.disabled = false;
-    vncBtn.style.pointerEvents = ''; vncBtn.style.opacity = '';
-    btn.textContent = btn.dataset.oldText || btn.textContent;
+    finished = true; clearTimeout(watchdog); clearTimeout(abortTimer);
+    if (e && e.name === 'AbortError') {{
+      busyText.textContent = '응답 대기 시간이 초과되어 최신 상태를 다시 불러옵니다.';
+      setTimeout(() => window.location.reload(), 700);
+    }} else {{
+      busyText.textContent = '요청 처리 중 오류가 발생했습니다. 최신 상태를 다시 확인합니다.';
+      setTimeout(() => window.location.reload(), 1200);
+    }}
   }}
 }}
 </script>

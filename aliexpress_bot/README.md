@@ -2,7 +2,7 @@
 
 AliExpress 웹의 Daily check-in Coins를 Home Assistant에서 자동으로 수령합니다.
 
-## v0.1.4 주요 기능
+## v0.1.5 주요 기능
 
 - `/data/chromium-profile`에 로그인 상태 영구 보존
 - 매일 지정 시각 자동 Collect
