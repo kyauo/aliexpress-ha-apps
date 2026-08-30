@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+- Fix Selenium connection to the already-running Chromium instance by using the packaged Alpine chromedriver explicitly.
+- Pin Chromium binary path to `/usr/bin/chromium-browser`.
+- Avoid Selenium Manager attempting to download or discover a Chrome driver inside the Home Assistant App container.
+
+
 ## v0.1.1
 
 - Replaced direct noVNC Ingress landing page with a lightweight status/control dashboard.

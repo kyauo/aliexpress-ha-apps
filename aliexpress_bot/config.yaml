@@ -1,6 +1,6 @@
 name: "AliExpress Coins Bot"
 description: "Collects AliExpress daily check-in coins with a persistent Chromium browser session and Home Assistant notifications."
-version: "0.1.1"
+version: "0.1.2"
 slug: "aliexpress_bot"
 init: false
 startup: application

@@ -14,6 +14,7 @@ import requests
 from selenium import webdriver
 from selenium.common.exceptions import JavascriptException, WebDriverException
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -115,8 +116,9 @@ def mobile_push(entity_id, message):
 def browser_driver():
     opts = Options()
     opts.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
-    opts.add_argument("--no-sandbox")
-    return webdriver.Chrome(options=opts)
+    opts.binary_location = "/usr/bin/chromium-browser"
+    service = Service(executable_path="/usr/bin/chromedriver")
+    return webdriver.Chrome(service=service, options=opts)
 
 
 def page_text(driver):

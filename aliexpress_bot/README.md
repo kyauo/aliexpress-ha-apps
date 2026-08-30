@@ -1,8 +1,8 @@
-# AliExpress Coins Bot v0.1.1
+# AliExpress Coins Bot v0.1.2
 
 Home Assistant App that keeps a persistent Chromium profile and collects the AliExpress daily browser coin check-in.
 
-## v0.1.1 workflow
+## v0.1.2 workflow
 
 OPEN WEB UI now opens a lightweight control/status page instead of noVNC directly.
 
